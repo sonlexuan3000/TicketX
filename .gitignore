@@ -1,0 +1,10 @@
+build/
+out/
+dist/
+node_modules/
+.DS_Store
+.cache/
+.vite/
+coverage/
+*.log
+compile_commands.json
