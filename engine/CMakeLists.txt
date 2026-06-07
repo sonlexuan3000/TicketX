@@ -1,5 +1,9 @@
 add_library(ticketx_engine
   src/ticketx_engine.cpp
+  src/matching_engine.cpp
+  src/order_book.cpp
+  src/ticket_ledger.cpp
+  src/wallet_ledger.cpp
 )
 
 target_include_directories(ticketx_engine
