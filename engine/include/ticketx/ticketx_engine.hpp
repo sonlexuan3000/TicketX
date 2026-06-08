@@ -63,6 +63,11 @@ private:
   void append_event(std::string_view type, std::string payload_json);
   void append_trade_events(const Trade& trade);
   void clear_filled_orders(const Trade& trade);
+  bool can_settle_locked_buyer_trade(const Trade& trade) const;
+  bool can_settle_market_buy_trade(const Trade& trade) const;
+
+  std::optional<Trade> preview_limit_trade(const Order& order) const;
+  std::optional<Trade> preview_market_trade(const Order& order) const;
 };
 
 } // namespace ticketx

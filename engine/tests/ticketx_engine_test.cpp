@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -253,6 +254,133 @@ TEST(TicketXEngineTest, EventLogRecordsSuccessfulTradeSettlement) {
   EXPECT_NE(engine.event_log()[2].payload_json.find("\"buy_order_id\":3"), std::string::npos);
   EXPECT_NE(engine.event_log()[2].payload_json.find("\"sell_order_id\":2"), std::string::npos);
   EXPECT_NE(engine.event_log()[3].payload_json.find("\"price\":1100000"), std::string::npos);
+}
+
+TEST(TicketXEngineTest, LimitBuyRejectsBeforeMatchingWhenSellerCreditWouldOverflow) {
+  constexpr ticketx::Money kMaxMoney = std::numeric_limits<ticketx::Money>::max();
+  ticketx::TicketXEngine engine;
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{200}, kMaxMoney));
+  ASSERT_TRUE(engine.issue_ticket(MakeTicket(1, 200)));
+  ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(2, 200, ticketx::Side::Sell, 1'100'000))
+                .status,
+            ticketx::OrderStatus::Open);
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'300'000));
+
+  const ticketx::ExecutionReport report =
+      engine.place_limit_order(MakeLimitOrder(3, 100, ticketx::Side::Buy, 1'300'000));
+
+  EXPECT_EQ(report.status, ticketx::OrderStatus::Rejected);
+  EXPECT_FALSE(report.trade.has_value());
+  ExpectBalance(engine, ticketx::UserId{100}, 1'300'000, 0);
+  ExpectBalance(engine, ticketx::UserId{200}, kMaxMoney, 0);
+  ASSERT_TRUE(engine.best_ask(ticketx::EventId{10}, "standard").has_value());
+  EXPECT_EQ(engine.best_ask(ticketx::EventId{10}, "standard")->id.value, 2);
+  EXPECT_FALSE(engine.best_bid(ticketx::EventId{10}, "standard").has_value());
+  EXPECT_TRUE(engine.locked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                  .has_value());
+  EXPECT_FALSE(engine.active_ticket(ticketx::UserId{100}, ticketx::EventId{10}).has_value());
+}
+
+TEST(TicketXEngineTest, SellLimitRejectsBeforeMatchingWhenSellerCreditWouldOverflow) {
+  constexpr ticketx::Money kMaxMoney = std::numeric_limits<ticketx::Money>::max();
+  ticketx::TicketXEngine engine;
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'200'000));
+  ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(2, 100, ticketx::Side::Buy, 1'200'000))
+                .status,
+            ticketx::OrderStatus::Open);
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{200}, kMaxMoney));
+  ASSERT_TRUE(engine.issue_ticket(MakeTicket(1, 200)));
+
+  const ticketx::ExecutionReport report =
+      engine.place_limit_order(MakeLimitOrder(3, 200, ticketx::Side::Sell, 1'100'000));
+
+  EXPECT_EQ(report.status, ticketx::OrderStatus::Rejected);
+  EXPECT_FALSE(report.trade.has_value());
+  ExpectBalance(engine, ticketx::UserId{100}, 0, 1'200'000);
+  ExpectBalance(engine, ticketx::UserId{200}, kMaxMoney, 0);
+  ASSERT_TRUE(engine.best_bid(ticketx::EventId{10}, "standard").has_value());
+  EXPECT_EQ(engine.best_bid(ticketx::EventId{10}, "standard")->id.value, 2);
+  EXPECT_FALSE(engine.best_ask(ticketx::EventId{10}, "standard").has_value());
+  EXPECT_TRUE(engine.unlocked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                  .has_value());
+  EXPECT_FALSE(engine.locked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                   .has_value());
+}
+
+TEST(TicketXEngineTest, LimitBuyRejectsBeforeMatchingWhenTicketCredentialWouldOverflow) {
+  ticketx::TicketXEngine engine;
+  ticketx::Ticket max_version_ticket = MakeTicket(1, 200);
+  max_version_ticket.credential_version = std::numeric_limits<std::uint64_t>::max();
+  ASSERT_TRUE(engine.issue_ticket(max_version_ticket));
+  ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(2, 200, ticketx::Side::Sell, 1'100'000))
+                .status,
+            ticketx::OrderStatus::Open);
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'300'000));
+
+  const ticketx::ExecutionReport report =
+      engine.place_limit_order(MakeLimitOrder(3, 100, ticketx::Side::Buy, 1'300'000));
+
+  EXPECT_EQ(report.status, ticketx::OrderStatus::Rejected);
+  EXPECT_FALSE(report.trade.has_value());
+  ExpectBalance(engine, ticketx::UserId{100}, 1'300'000, 0);
+  ASSERT_TRUE(engine.best_ask(ticketx::EventId{10}, "standard").has_value());
+  EXPECT_EQ(engine.best_ask(ticketx::EventId{10}, "standard")->id.value, 2);
+  ASSERT_TRUE(engine.locked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                  .has_value());
+  EXPECT_EQ(engine.locked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                ->credential_version,
+            std::numeric_limits<std::uint64_t>::max());
+  EXPECT_FALSE(engine.active_ticket(ticketx::UserId{100}, ticketx::EventId{10}).has_value());
+}
+
+TEST(TicketXEngineTest, MarketBuyRejectsBeforeMatchingWhenSellerCreditWouldOverflow) {
+  constexpr ticketx::Money kMaxMoney = std::numeric_limits<ticketx::Money>::max();
+  ticketx::TicketXEngine engine;
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{200}, kMaxMoney));
+  ASSERT_TRUE(engine.issue_ticket(MakeTicket(1, 200)));
+  ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(2, 200, ticketx::Side::Sell, 1'100'000))
+                .status,
+            ticketx::OrderStatus::Open);
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'100'000));
+
+  const ticketx::ExecutionReport report =
+      engine.place_market_order(MakeMarketOrder(3, 100, ticketx::Side::Buy));
+
+  EXPECT_EQ(report.status, ticketx::OrderStatus::Rejected);
+  EXPECT_FALSE(report.trade.has_value());
+  ExpectBalance(engine, ticketx::UserId{100}, 1'100'000, 0);
+  ExpectBalance(engine, ticketx::UserId{200}, kMaxMoney, 0);
+  ASSERT_TRUE(engine.best_ask(ticketx::EventId{10}, "standard").has_value());
+  EXPECT_EQ(engine.best_ask(ticketx::EventId{10}, "standard")->id.value, 2);
+  EXPECT_TRUE(engine.locked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                  .has_value());
+  EXPECT_FALSE(engine.active_ticket(ticketx::UserId{100}, ticketx::EventId{10}).has_value());
+}
+
+TEST(TicketXEngineTest, MarketSellRejectsBeforeMatchingWhenSellerCreditWouldOverflow) {
+  constexpr ticketx::Money kMaxMoney = std::numeric_limits<ticketx::Money>::max();
+  ticketx::TicketXEngine engine;
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'200'000));
+  ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(2, 100, ticketx::Side::Buy, 1'200'000))
+                .status,
+            ticketx::OrderStatus::Open);
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{200}, kMaxMoney));
+  ASSERT_TRUE(engine.issue_ticket(MakeTicket(1, 200)));
+
+  const ticketx::ExecutionReport report =
+      engine.place_market_order(MakeMarketOrder(3, 200, ticketx::Side::Sell));
+
+  EXPECT_EQ(report.status, ticketx::OrderStatus::Rejected);
+  EXPECT_FALSE(report.trade.has_value());
+  ExpectBalance(engine, ticketx::UserId{100}, 0, 1'200'000);
+  ExpectBalance(engine, ticketx::UserId{200}, kMaxMoney, 0);
+  ASSERT_TRUE(engine.best_bid(ticketx::EventId{10}, "standard").has_value());
+  EXPECT_EQ(engine.best_bid(ticketx::EventId{10}, "standard")->id.value, 2);
+  EXPECT_TRUE(engine.unlocked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                  .has_value());
+  EXPECT_FALSE(engine.locked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                   .has_value());
+  EXPECT_FALSE(engine.active_ticket(ticketx::UserId{100}, ticketx::EventId{10}).has_value());
 }
 
 TEST(TicketXEngineTest, MarketBuySettlesAgainstBestAsk) {

@@ -229,6 +229,13 @@ ExecutionReport TicketXEngine::place_buy_limit(Order order, Money limit_price) {
   }
 
   locked_buy_amounts_.emplace(order.id.value, limit_price);
+  const std::optional<Trade> preview_trade = preview_limit_trade(order);
+  if (preview_trade.has_value() && !can_settle_locked_buyer_trade(*preview_trade)) {
+    wallets_.unlock_funds(order.user_id, limit_price);
+    locked_buy_amounts_.erase(order.id.value);
+    return RejectedReportFor(order);
+  }
+
   ExecutionReport report = matching_engine_.place_limit_order(order);
   if (report.status == OrderStatus::Rejected) {
     wallets_.unlock_funds(order.user_id, limit_price);
@@ -253,6 +260,12 @@ ExecutionReport TicketXEngine::place_sell_limit(Order order) {
   const std::optional<Ticket> locked_ticket =
       tickets_.lock_ticket(order.user_id, order.event_id, order.category);
   if (!locked_ticket.has_value()) {
+    return RejectedReportFor(order);
+  }
+
+  const std::optional<Trade> preview_trade = preview_limit_trade(order);
+  if (preview_trade.has_value() && !can_settle_locked_buyer_trade(*preview_trade)) {
+    tickets_.unlock_ticket(order.user_id, order.event_id, order.category);
     return RejectedReportFor(order);
   }
 
@@ -291,11 +304,8 @@ ExecutionReport TicketXEngine::place_market_buy(Order order) {
     return RejectedReportFor(order);
   }
 
-  const std::optional<Order> best_ask = matching_engine_.best_ask(order.event_id, order.category);
-  if (!best_ask.has_value() || !best_ask->limit_price.has_value()) {
-    return RejectedReportFor(order);
-  }
-  if (wallets_.balance(order.user_id).available < *best_ask->limit_price) {
+  const std::optional<Trade> preview_trade = preview_market_trade(order);
+  if (!preview_trade.has_value() || !can_settle_market_buy_trade(*preview_trade)) {
     return RejectedReportFor(order);
   }
 
@@ -313,6 +323,12 @@ ExecutionReport TicketXEngine::place_market_sell(Order order) {
   const std::optional<Ticket> locked_ticket =
       tickets_.lock_ticket(order.user_id, order.event_id, order.category);
   if (!locked_ticket.has_value()) {
+    return RejectedReportFor(order);
+  }
+
+  const std::optional<Trade> preview_trade = preview_market_trade(order);
+  if (!preview_trade.has_value() || !can_settle_locked_buyer_trade(*preview_trade)) {
+    tickets_.unlock_ticket(order.user_id, order.event_id, order.category);
     return RejectedReportFor(order);
   }
 
@@ -367,12 +383,11 @@ std::optional<Order> TicketXEngine::best_ask(EventId event_id,
 }
 
 bool TicketXEngine::settle_locked_buyer_trade(const Trade& trade) {
-  const auto locked_it = locked_buy_amounts_.find(trade.buy_order_id.value);
-  if (locked_it == locked_buy_amounts_.end() || locked_it->second < trade.price ||
-      !can_credit(trade.seller_user_id, trade.price) || !can_transfer_ticket(trade)) {
+  if (!can_settle_locked_buyer_trade(trade)) {
     return false;
   }
 
+  const auto locked_it = locked_buy_amounts_.find(trade.buy_order_id.value);
   const Money locked_amount = locked_it->second;
   if (!wallets_.debit_locked(trade.buyer_user_id, trade.price)) {
     return false;
@@ -398,7 +413,7 @@ bool TicketXEngine::settle_locked_buyer_trade(const Trade& trade) {
 }
 
 bool TicketXEngine::settle_market_buy_trade(const Trade& trade) {
-  if (!can_credit(trade.seller_user_id, trade.price) || !can_transfer_ticket(trade)) {
+  if (!can_settle_market_buy_trade(trade)) {
     return false;
   }
   if (!wallets_.withdraw(trade.buyer_user_id, trade.price)) {
@@ -430,8 +445,17 @@ bool TicketXEngine::can_transfer_ticket(const Trade& trade) const {
   if (tickets_.owns_active_ticket(trade.buyer_user_id, trade.event_id)) {
     return false;
   }
-  return tickets_.locked_ticket(trade.seller_user_id, trade.event_id, trade.category).has_value() ||
-         tickets_.unlocked_ticket(trade.seller_user_id, trade.event_id, trade.category).has_value();
+
+  const std::optional<Ticket> locked_ticket =
+      tickets_.locked_ticket(trade.seller_user_id, trade.event_id, trade.category);
+  if (locked_ticket.has_value()) {
+    return locked_ticket->credential_version < std::numeric_limits<std::uint64_t>::max();
+  }
+
+  const std::optional<Ticket> unlocked_ticket =
+      tickets_.unlocked_ticket(trade.seller_user_id, trade.event_id, trade.category);
+  return unlocked_ticket.has_value() &&
+         unlocked_ticket->credential_version < std::numeric_limits<std::uint64_t>::max();
 }
 
 bool TicketXEngine::has_open_buy_for_event(UserId user_id, EventId event_id) const {
@@ -461,6 +485,98 @@ void TicketXEngine::append_trade_events(const Trade& trade) {
   append_event(event_type::OrderMatched, MatchPayload(trade));
   append_event(event_type::WalletSettled, WalletSettlementPayload(trade));
   append_event(event_type::TicketTransferred, TicketTransferPayload(trade));
+}
+
+bool TicketXEngine::can_settle_locked_buyer_trade(const Trade& trade) const {
+  const auto locked_it = locked_buy_amounts_.find(trade.buy_order_id.value);
+  if (locked_it == locked_buy_amounts_.end() || locked_it->second < trade.price) {
+    return false;
+  }
+  return can_credit(trade.seller_user_id, trade.price) && can_transfer_ticket(trade) &&
+         wallets_.balance(trade.buyer_user_id).locked >= locked_it->second;
+}
+
+bool TicketXEngine::can_settle_market_buy_trade(const Trade& trade) const {
+  return can_credit(trade.seller_user_id, trade.price) && can_transfer_ticket(trade) &&
+         wallets_.balance(trade.buyer_user_id).available >= trade.price;
+}
+
+std::optional<Trade> TicketXEngine::preview_limit_trade(const Order& order) const {
+  if (!IsValidLimitOrder(order) || order.category.empty()) {
+    return std::nullopt;
+  }
+
+  if (order.side == Side::Buy) {
+    const std::optional<Order> best_ask =
+        matching_engine_.best_ask(order.event_id, order.category);
+    if (!best_ask.has_value() || !best_ask->limit_price.has_value() ||
+        *best_ask->limit_price > *order.limit_price) {
+      return std::nullopt;
+    }
+    return Trade{
+        .buy_order_id = order.id,
+        .sell_order_id = best_ask->id,
+        .buyer_user_id = order.user_id,
+        .seller_user_id = best_ask->user_id,
+        .event_id = order.event_id,
+        .category = order.category,
+        .price = *best_ask->limit_price,
+    };
+  }
+
+  const std::optional<Order> best_bid =
+      matching_engine_.best_bid(order.event_id, order.category);
+  if (!best_bid.has_value() || !best_bid->limit_price.has_value() ||
+      *best_bid->limit_price < *order.limit_price) {
+    return std::nullopt;
+  }
+  return Trade{
+      .buy_order_id = best_bid->id,
+      .sell_order_id = order.id,
+      .buyer_user_id = best_bid->user_id,
+      .seller_user_id = order.user_id,
+      .event_id = order.event_id,
+      .category = order.category,
+      .price = *best_bid->limit_price,
+  };
+}
+
+std::optional<Trade> TicketXEngine::preview_market_trade(const Order& order) const {
+  if (!IsValidMarketOrder(order) || order.category.empty()) {
+    return std::nullopt;
+  }
+
+  if (order.side == Side::Buy) {
+    const std::optional<Order> best_ask =
+        matching_engine_.best_ask(order.event_id, order.category);
+    if (!best_ask.has_value() || !best_ask->limit_price.has_value()) {
+      return std::nullopt;
+    }
+    return Trade{
+        .buy_order_id = order.id,
+        .sell_order_id = best_ask->id,
+        .buyer_user_id = order.user_id,
+        .seller_user_id = best_ask->user_id,
+        .event_id = order.event_id,
+        .category = order.category,
+        .price = *best_ask->limit_price,
+    };
+  }
+
+  const std::optional<Order> best_bid =
+      matching_engine_.best_bid(order.event_id, order.category);
+  if (!best_bid.has_value() || !best_bid->limit_price.has_value()) {
+    return std::nullopt;
+  }
+  return Trade{
+      .buy_order_id = best_bid->id,
+      .sell_order_id = order.id,
+      .buyer_user_id = best_bid->user_id,
+      .seller_user_id = order.user_id,
+      .event_id = order.event_id,
+      .category = order.category,
+      .price = *best_bid->limit_price,
+  };
 }
 
 std::string_view version() noexcept { return "0.1.0"; }
