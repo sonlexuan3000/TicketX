@@ -133,3 +133,78 @@ TEST(EventStoreTest, LoadedLogCanReplayState) {
 
   std::filesystem::remove(path);
 }
+
+TEST(EventStoreTest, LoadReplayStateFromFileValidatesThenReplays) {
+  const std::filesystem::path path = TempEventLogPath("validated_replay");
+  std::filesystem::remove(path);
+  ASSERT_TRUE(ticketx::append_event_record(
+      path, ticketx::EventRecord{
+                .sequence_id = 1,
+                .type = std::string{ticketx::event_type::WalletDeposited},
+                .payload_json = "{\"user_id\":100,\"amount\":1000000}",
+            }));
+  ASSERT_TRUE(ticketx::append_event_record(
+      path, ticketx::EventRecord{
+                .sequence_id = 2,
+                .type = std::string{ticketx::event_type::OrderPlaced},
+                .payload_json =
+                    "{\"order_id\":10,\"user_id\":100,\"event_id\":7,"
+                    "\"category\":\"vip\",\"side\":\"Buy\",\"type\":\"Limit\","
+                    "\"limit_price\":700000,\"status\":\"Open\"}",
+            }));
+
+  const ticketx::ReplayLoadResult result =
+      ticketx::load_replay_state_from_event_log_file(path);
+
+  EXPECT_TRUE(result.report.ok);
+  EXPECT_TRUE(result.report.errors.empty());
+  EXPECT_EQ(result.report.event_count, 2U);
+  ASSERT_TRUE(result.state.has_value());
+  ASSERT_TRUE(result.state->wallets.contains(100));
+  EXPECT_EQ(result.state->wallets.at(100).available, 300'000);
+  EXPECT_EQ(result.state->wallets.at(100).locked, 700'000);
+  ASSERT_TRUE(result.state->open_orders.contains(10));
+
+  std::filesystem::remove(path);
+}
+
+TEST(EventStoreTest, LoadReplayStateFromFileRejectsMalformedJsonl) {
+  const std::filesystem::path path = TempEventLogPath("validated_malformed");
+  {
+    std::ofstream output{path};
+    ASSERT_TRUE(output.is_open());
+    output << "{not json}\n";
+  }
+
+  const ticketx::ReplayLoadResult result =
+      ticketx::load_replay_state_from_event_log_file(path);
+
+  EXPECT_FALSE(result.report.ok);
+  EXPECT_EQ(result.report.event_count, 0U);
+  ASSERT_EQ(result.report.errors.size(), 1U);
+  EXPECT_EQ(result.report.errors[0], "failed to load event log file");
+  EXPECT_FALSE(result.state.has_value());
+
+  std::filesystem::remove(path);
+}
+
+TEST(EventStoreTest, LoadReplayStateFromFileRejectsRecoveryInvalidLog) {
+  const std::filesystem::path path = TempEventLogPath("validated_invalid_log");
+  std::filesystem::remove(path);
+  ASSERT_TRUE(ticketx::append_event_record(
+      path, ticketx::EventRecord{
+                .sequence_id = 1,
+                .type = std::string{ticketx::event_type::WalletDeposited},
+                .payload_json = "{\"user_id\":100}",
+            }));
+
+  const ticketx::ReplayLoadResult result =
+      ticketx::load_replay_state_from_event_log_file(path);
+
+  EXPECT_FALSE(result.report.ok);
+  EXPECT_EQ(result.report.event_count, 1U);
+  EXPECT_FALSE(result.report.errors.empty());
+  EXPECT_FALSE(result.state.has_value());
+
+  std::filesystem::remove(path);
+}

@@ -14,8 +14,11 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace ticketx {
+
+struct ReplayState;
 
 class TicketXEngine {
 public:
@@ -26,6 +29,10 @@ public:
   std::optional<Event> event(EventId event_id) const;
   PrimaryBuyResult primary_buy(UserId user_id, EventId event_id, const std::string& category);
   [[nodiscard]] const EventLog& event_log() const noexcept { return event_log_; }
+  [[nodiscard]] bool event_log_recovery_ok() const noexcept { return event_log_recovery_ok_; }
+  [[nodiscard]] const std::vector<std::string>& event_log_recovery_errors() const noexcept {
+    return event_log_recovery_errors_;
+  }
 
   bool deposit(UserId user_id, Money amount);
   bool issue_ticket(Ticket ticket);
@@ -50,11 +57,13 @@ private:
   TicketLedger tickets_;
   EventLog event_log_;
   std::unique_ptr<AsyncEventWriter> event_writer_;
+  std::vector<std::string> event_log_recovery_errors_;
   std::unordered_map<std::uint64_t, Event> events_;
   std::unordered_map<std::uint64_t, Order> open_orders_;
   std::unordered_map<std::uint64_t, Money> locked_buy_amounts_;
   std::uint64_t next_ticket_id_{1};
   std::uint64_t next_event_sequence_id_{1};
+  bool event_log_recovery_ok_{true};
 
   ExecutionReport place_buy_limit(Order order, Money limit_price);
   ExecutionReport place_sell_limit(Order order);
@@ -76,6 +85,9 @@ private:
 
   std::optional<Trade> preview_limit_trade(const Order& order) const;
   std::optional<Trade> preview_market_trade(const Order& order) const;
+  bool accepts_commands() const noexcept;
+  void mark_recovery_failed(std::vector<std::string> errors);
+  bool hydrate_from_replay_state(const ReplayState& state);
 };
 
 } // namespace ticketx

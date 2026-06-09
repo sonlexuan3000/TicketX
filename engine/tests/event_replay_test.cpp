@@ -62,6 +62,15 @@ ticketx::Ticket MakeTicket(std::uint64_t ticket_id, std::uint64_t owner_user_id,
   };
 }
 
+bool HasErrorContaining(const ticketx::RecoveryReport& report, const std::string& text) {
+  for (const std::string& error : report.errors) {
+    if (error.find(text) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 TEST(EventReplayTest, EmptyLogProducesEmptySummary) {
@@ -194,6 +203,196 @@ TEST(EventReplayTest, DetectsOrphanTradeEffectEvent) {
   EXPECT_FALSE(summary.trade_groups_complete);
 }
 
+TEST(EventReplayTest, ValidateRecoveryLogAcceptsEngineEventLog) {
+  ticketx::TicketXEngine engine;
+  ASSERT_TRUE(engine.create_event(MakeTicketEvent()));
+  ASSERT_TRUE(engine.issue_ticket(MakeTicket(1, 200)));
+  ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'300'000));
+  ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(2, 200, ticketx::Side::Sell, 1'100'000))
+                .status,
+            ticketx::OrderStatus::Open);
+
+  const ticketx::ExecutionReport report =
+      engine.place_limit_order(MakeLimitOrder(3, 100, ticketx::Side::Buy, 1'300'000));
+  ASSERT_EQ(report.status, ticketx::OrderStatus::Filled);
+
+  const ticketx::RecoveryReport recovery_report =
+      ticketx::validate_recovery_log(engine.event_log());
+
+  EXPECT_TRUE(recovery_report.ok);
+  EXPECT_TRUE(recovery_report.errors.empty());
+  EXPECT_EQ(recovery_report.event_count, engine.event_log().size());
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsSequenceGap) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":100,\"amount\":1000000}"),
+      MakeEvent(3, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":100,\"amount\":500000}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "sequence gap"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsMalformedPayload) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::WalletDeposited}, "{not json"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "malformed payload"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsInvalidPayloadShape) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::WalletSettled},
+                "{\"buyer_user_id\":100,\"seller_user_id\":200}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "invalid payload shape"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsUnknownEventType) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, "SomethingElse", "{}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "unknown event type"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsIncompleteTradeGroup) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::OrderMatched},
+                "{\"buy_order_id\":10,\"sell_order_id\":20}"),
+      MakeEvent(2, std::string{ticketx::event_type::WalletSettled},
+                "{\"buyer_user_id\":100,\"seller_user_id\":200,\"price\":1000000}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "incomplete trade group"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsInconsistentTradeGroupPayloads) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::OrderMatched},
+                "{\"buy_order_id\":10,\"sell_order_id\":20,\"buyer_user_id\":100,"
+                "\"seller_user_id\":200,\"event_id\":7,\"category\":\"vip\","
+                "\"price\":1000000}"),
+      MakeEvent(2, std::string{ticketx::event_type::WalletSettled},
+                "{\"buyer_user_id\":100,\"seller_user_id\":200,\"event_id\":7,"
+                "\"category\":\"vip\",\"price\":900000}"),
+      MakeEvent(3, std::string{ticketx::event_type::TicketTransferred},
+                "{\"buyer_user_id\":100,\"seller_user_id\":200,\"event_id\":7,"
+                "\"category\":\"vip\"}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "inconsistent trade group"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsInvalidEventDefinition) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::EventCreated},
+                "{\"event_id\":7,\"name\":\"TicketX Live\",\"categories\":[]}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "invalid payload shape"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsDuplicateEventDefinition) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::EventCreated},
+                "{\"event_id\":7,\"name\":\"TicketX Live\",\"categories\":["
+                "{\"name\":\"vip\",\"price\":500000,\"remaining\":2}]}"),
+      MakeEvent(2, std::string{ticketx::event_type::EventCreated},
+                "{\"event_id\":7,\"name\":\"TicketX Encore\",\"categories\":["
+                "{\"name\":\"vip\",\"price\":500000,\"remaining\":2}]}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "event already exists"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsOrderOpenWithoutFunds) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":100,\"amount\":500000}"),
+      MakeEvent(2, std::string{ticketx::event_type::OrderPlaced},
+                "{\"order_id\":10,\"user_id\":100,\"event_id\":7,\"category\":\"vip\","
+                "\"side\":\"Buy\",\"type\":\"Limit\",\"limit_price\":700000,"
+                "\"status\":\"Open\"}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "order cannot be opened"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsPrimaryBuyWithoutInventory) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::EventCreated},
+                "{\"event_id\":7,\"name\":\"TicketX Live\",\"categories\":["
+                "{\"name\":\"vip\",\"price\":500000,\"remaining\":0}]}"),
+      MakeEvent(2, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":100,\"amount\":500000}"),
+      MakeEvent(3, std::string{ticketx::event_type::PrimaryTicketBought},
+                "{\"ticket_id\":30,\"buyer_user_id\":100,\"event_id\":7,"
+                "\"category\":\"vip\",\"price\":500000,\"credential_version\":1}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "primary buy cannot be applied"));
+}
+
+TEST(EventReplayTest, ValidateRecoveryLogRejectsTradeWithoutOpenMakerOrder) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":100,\"amount\":1000000}"),
+      MakeEvent(2, std::string{ticketx::event_type::TicketIssued},
+                "{\"ticket_id\":30,\"owner_user_id\":200,\"event_id\":7,"
+                "\"category\":\"vip\",\"status\":\"Owned\",\"credential_version\":1}"),
+      MakeEvent(3, std::string{ticketx::event_type::OrderMatched},
+                "{\"buy_order_id\":10,\"sell_order_id\":20,\"buyer_user_id\":100,"
+                "\"seller_user_id\":200,\"event_id\":7,\"category\":\"vip\","
+                "\"price\":500000}"),
+      MakeEvent(4, std::string{ticketx::event_type::WalletSettled},
+                "{\"buyer_user_id\":100,\"seller_user_id\":200,\"event_id\":7,"
+                "\"category\":\"vip\",\"price\":500000}"),
+      MakeEvent(5, std::string{ticketx::event_type::TicketTransferred},
+                "{\"buyer_user_id\":100,\"seller_user_id\":200,\"event_id\":7,"
+                "\"category\":\"vip\"}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+
+  EXPECT_FALSE(report.ok);
+  EXPECT_TRUE(HasErrorContaining(report, "trade group cannot be applied"));
+}
+
 TEST(EventReplayTest, ReplayStateAppliesWalletDeposits) {
   const ticketx::EventLog event_log{
       MakeEvent(1, std::string{ticketx::event_type::WalletDeposited},
@@ -286,6 +485,39 @@ TEST(EventReplayTest, ReplayStateUnlocksFundsWhenBuyOrderIsCancelled) {
   EXPECT_FALSE(state.open_orders.contains(10));
 }
 
+TEST(EventReplayTest, ReplayStateKeepsReusedOrderIdAtLatestOpenPosition) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":100,\"amount\":1000000}"),
+      MakeEvent(2, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":200,\"amount\":1000000}"),
+      MakeEvent(3, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":300,\"amount\":1000000}"),
+      MakeEvent(4, std::string{ticketx::event_type::OrderPlaced},
+                "{\"order_id\":10,\"user_id\":100,\"event_id\":7,\"category\":\"vip\","
+                "\"side\":\"Buy\",\"type\":\"Limit\",\"limit_price\":700000,"
+                "\"status\":\"Open\"}"),
+      MakeEvent(5, std::string{ticketx::event_type::OrderCancelled}, "{\"order_id\":10}"),
+      MakeEvent(6, std::string{ticketx::event_type::OrderPlaced},
+                "{\"order_id\":11,\"user_id\":200,\"event_id\":7,\"category\":\"vip\","
+                "\"side\":\"Buy\",\"type\":\"Limit\",\"limit_price\":700000,"
+                "\"status\":\"Open\"}"),
+      MakeEvent(7, std::string{ticketx::event_type::OrderPlaced},
+                "{\"order_id\":10,\"user_id\":300,\"event_id\":7,\"category\":\"vip\","
+                "\"side\":\"Buy\",\"type\":\"Limit\",\"limit_price\":700000,"
+                "\"status\":\"Open\"}"),
+  };
+
+  const ticketx::ReplayState state = ticketx::replay_state(event_log);
+
+  ASSERT_TRUE(state.open_orders.contains(10));
+  ASSERT_TRUE(state.open_orders.contains(11));
+  ASSERT_EQ(state.open_order_sequence.size(), 2U);
+  EXPECT_EQ(state.open_order_sequence[0], 11U);
+  EXPECT_EQ(state.open_order_sequence[1], 10U);
+  EXPECT_EQ(state.open_orders.at(10).user_id.value, 300U);
+}
+
 TEST(EventReplayTest, ReplayStateDoesNotMutateWalletForSellOrderLifecycle) {
   const ticketx::EventLog event_log{
       MakeEvent(1, std::string{ticketx::event_type::WalletDeposited},
@@ -303,6 +535,46 @@ TEST(EventReplayTest, ReplayStateDoesNotMutateWalletForSellOrderLifecycle) {
   EXPECT_EQ(state.wallets.at(200).available, 500'000);
   EXPECT_EQ(state.wallets.at(200).locked, 0);
   EXPECT_TRUE(state.open_orders.empty());
+}
+
+TEST(EventReplayTest, ReplayStateLocksTicketForOpenSellOrder) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::TicketIssued},
+                "{\"ticket_id\":30,\"owner_user_id\":200,\"event_id\":7,"
+                "\"category\":\"vip\",\"status\":\"Owned\",\"credential_version\":1}"),
+      MakeEvent(2, std::string{ticketx::event_type::OrderPlaced},
+                "{\"order_id\":20,\"user_id\":200,\"event_id\":7,\"category\":\"vip\","
+                "\"side\":\"Sell\",\"type\":\"Limit\",\"limit_price\":900000,"
+                "\"status\":\"Open\"}"),
+  };
+
+  const ticketx::ReplayState state = ticketx::replay_state(event_log);
+
+  ASSERT_TRUE(state.tickets.contains(30));
+  EXPECT_EQ(state.tickets.at(30).status, ticketx::TicketStatus::LockedForSell);
+  ASSERT_TRUE(state.open_orders.contains(20));
+  ASSERT_EQ(state.open_order_sequence.size(), 1U);
+  EXPECT_EQ(state.open_order_sequence[0], 20U);
+}
+
+TEST(EventReplayTest, ReplayStateUnlocksTicketWhenSellOrderIsCancelled) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::TicketIssued},
+                "{\"ticket_id\":30,\"owner_user_id\":200,\"event_id\":7,"
+                "\"category\":\"vip\",\"status\":\"Owned\",\"credential_version\":1}"),
+      MakeEvent(2, std::string{ticketx::event_type::OrderPlaced},
+                "{\"order_id\":20,\"user_id\":200,\"event_id\":7,\"category\":\"vip\","
+                "\"side\":\"Sell\",\"type\":\"Limit\",\"limit_price\":900000,"
+                "\"status\":\"Open\"}"),
+      MakeEvent(3, std::string{ticketx::event_type::OrderCancelled}, "{\"order_id\":20}"),
+  };
+
+  const ticketx::ReplayState state = ticketx::replay_state(event_log);
+
+  ASSERT_TRUE(state.tickets.contains(30));
+  EXPECT_EQ(state.tickets.at(30).status, ticketx::TicketStatus::Owned);
+  EXPECT_TRUE(state.open_orders.empty());
+  EXPECT_TRUE(state.open_order_sequence.empty());
 }
 
 TEST(EventReplayTest, ReplayStateIgnoresCancelForMissingOrder) {
@@ -421,6 +693,50 @@ TEST(EventReplayTest, ReplayStateSkipsWalletSettlementWhenSellerCreditWouldOverf
   EXPECT_EQ(state.wallets.at(200).locked, 0);
 }
 
+TEST(EventReplayTest, ReplayStateSettlesMarketBuyWithoutTouchingUnrelatedLockedFunds) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":100,\"amount\":2000000}"),
+      MakeEvent(2, std::string{ticketx::event_type::OrderPlaced},
+                "{\"order_id\":10,\"user_id\":100,\"event_id\":7,\"category\":\"vip\","
+                "\"side\":\"Buy\",\"type\":\"Limit\",\"limit_price\":700000,"
+                "\"status\":\"Open\"}"),
+      MakeEvent(3, std::string{ticketx::event_type::TicketIssued},
+                "{\"ticket_id\":30,\"owner_user_id\":200,\"event_id\":8,"
+                "\"category\":\"standard\",\"status\":\"Owned\",\"credential_version\":1}"),
+      MakeEvent(4, std::string{ticketx::event_type::OrderPlaced},
+                "{\"order_id\":20,\"user_id\":200,\"event_id\":8,"
+                "\"category\":\"standard\",\"side\":\"Sell\",\"type\":\"Limit\","
+                "\"limit_price\":500000,\"status\":\"Open\"}"),
+      MakeEvent(5, std::string{ticketx::event_type::OrderMatched},
+                "{\"buy_order_id\":30,\"sell_order_id\":20,\"buyer_user_id\":100,"
+                "\"seller_user_id\":200,\"event_id\":8,\"category\":\"standard\","
+                "\"price\":500000}"),
+      MakeEvent(6, std::string{ticketx::event_type::WalletSettled},
+                "{\"buyer_user_id\":100,\"seller_user_id\":200,\"event_id\":8,"
+                "\"category\":\"standard\",\"price\":500000}"),
+      MakeEvent(7, std::string{ticketx::event_type::TicketTransferred},
+                "{\"buyer_user_id\":100,\"seller_user_id\":200,\"event_id\":8,"
+                "\"category\":\"standard\"}"),
+  };
+
+  const ticketx::RecoveryReport report = ticketx::validate_recovery_log(event_log);
+  ASSERT_TRUE(report.ok) << (report.errors.empty() ? "" : report.errors[0]);
+
+  const ticketx::ReplayState state = ticketx::replay_state(event_log);
+
+  ASSERT_TRUE(state.wallets.contains(100));
+  EXPECT_EQ(state.wallets.at(100).available, 800'000);
+  EXPECT_EQ(state.wallets.at(100).locked, 700'000);
+  ASSERT_TRUE(state.wallets.contains(200));
+  EXPECT_EQ(state.wallets.at(200).available, 500'000);
+  ASSERT_TRUE(state.open_orders.contains(10));
+  EXPECT_FALSE(state.open_orders.contains(20));
+  ASSERT_TRUE(state.tickets.contains(30));
+  EXPECT_EQ(state.tickets.at(30).owner_user_id.value, 100U);
+  EXPECT_EQ(state.tickets.at(30).credential_version, 2U);
+}
+
 TEST(EventReplayTest, ReplayStateAppliesTicketIssued) {
   const ticketx::EventLog event_log{
       MakeEvent(1, std::string{ticketx::event_type::TicketIssued},
@@ -456,6 +772,29 @@ TEST(EventReplayTest, ReplayStateAppliesPrimaryTicketBought) {
   EXPECT_EQ(ticket.category, "vip");
   EXPECT_EQ(ticket.status, ticketx::TicketStatus::Owned);
   EXPECT_EQ(ticket.credential_version, 1U);
+}
+
+TEST(EventReplayTest, ReplayStateDebitsPrimaryBuyAndDecrementsInventory) {
+  const ticketx::EventLog event_log{
+      MakeEvent(1, std::string{ticketx::event_type::EventCreated},
+                "{\"event_id\":7,\"name\":\"TicketX Live\",\"categories\":["
+                "{\"name\":\"vip\",\"price\":500000,\"remaining\":2}]}"),
+      MakeEvent(2, std::string{ticketx::event_type::WalletDeposited},
+                "{\"user_id\":100,\"amount\":1000000}"),
+      MakeEvent(3, std::string{ticketx::event_type::PrimaryTicketBought},
+                "{\"ticket_id\":30,\"buyer_user_id\":100,\"event_id\":7,"
+                "\"category\":\"vip\",\"price\":500000,\"credential_version\":1}"),
+  };
+
+  const ticketx::ReplayState state = ticketx::replay_state(event_log);
+
+  ASSERT_TRUE(state.wallets.contains(100));
+  EXPECT_EQ(state.wallets.at(100).available, 500'000);
+  ASSERT_TRUE(state.events.contains(7));
+  ASSERT_EQ(state.events.at(7).categories.size(), 1U);
+  EXPECT_EQ(state.events.at(7).categories[0].remaining, 1U);
+  ASSERT_TRUE(state.tickets.contains(30));
+  EXPECT_EQ(state.max_ticket_id, 30U);
 }
 
 TEST(EventReplayTest, ReplayStateAllowsSameUserTicketsForDifferentEvents) {

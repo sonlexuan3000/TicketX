@@ -55,6 +55,32 @@ ticketx::Ticket MakeTicket(std::uint64_t ticket_id, std::uint64_t owner_id,
   };
 }
 
+ticketx::Event MakeEventDefinition(std::uint64_t event_id = 10,
+                                   std::uint64_t remaining = 500) {
+  return ticketx::Event{
+      .id = ticketx::EventId{event_id},
+      .name = "TicketX Live",
+      .categories =
+          {
+              ticketx::PrimarySaleCategory{
+                  .name = "standard",
+                  .price = 1'000'000,
+                  .remaining = remaining,
+              },
+          },
+  };
+}
+
+const ticketx::PrimarySaleCategory* FindCategory(const ticketx::Event& event,
+                                                 const std::string& category) {
+  for (const ticketx::PrimarySaleCategory& candidate : event.categories) {
+    if (candidate.name == category) {
+      return &candidate;
+    }
+  }
+  return nullptr;
+}
+
 void ExpectBalance(const ticketx::TicketXEngine& engine, ticketx::UserId user_id,
                    ticketx::Money available, ticketx::Money locked) {
   const ticketx::WalletBalance balance = engine.wallet_balance(user_id);
@@ -331,6 +357,228 @@ TEST(TicketXEngineTest, AsyncEventWriterPersistsTradeEventGroupOnDestruction) {
     EXPECT_EQ(loaded->at(i).sequence_id, expected_log[i].sequence_id);
     EXPECT_EQ(loaded->at(i).payload_json, expected_log[i].payload_json);
   }
+
+  std::filesystem::remove(path);
+}
+
+TEST(TicketXEngineTest, PathConstructorResumesExistingEventLogSequence) {
+  const std::filesystem::path path = TempEngineEventLogPath("resume_sequence");
+  std::filesystem::remove(path);
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'000));
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+  }
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+    ASSERT_EQ(engine.event_log().size(), 1U);
+    EXPECT_EQ(engine.event_log()[0].sequence_id, 1U);
+
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{200}, 2'000));
+    ASSERT_EQ(engine.event_log().size(), 2U);
+    EXPECT_EQ(engine.event_log()[1].sequence_id, 2U);
+  }
+
+  const std::optional<ticketx::EventLog> loaded = ticketx::load_event_log(path);
+  ASSERT_TRUE(loaded.has_value());
+  ASSERT_EQ(loaded->size(), 2U);
+  EXPECT_EQ(loaded->at(0).sequence_id, 1U);
+  EXPECT_EQ(loaded->at(1).sequence_id, 2U);
+
+  std::filesystem::remove(path);
+}
+
+TEST(TicketXEngineTest, PathConstructorRestoresEngineStateFromEventLog) {
+  const std::filesystem::path path = TempEngineEventLogPath("restore_state");
+  std::filesystem::remove(path);
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.create_event(MakeEventDefinition()));
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'500'000));
+    ASSERT_EQ(engine.primary_buy(ticketx::UserId{100}, ticketx::EventId{10}, "standard")
+                  .status,
+              ticketx::PrimaryBuyStatus::Accepted);
+    ASSERT_TRUE(engine.issue_ticket(MakeTicket(10, 200)));
+    ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(20, 200, ticketx::Side::Sell, 1'100'000))
+                  .status,
+              ticketx::OrderStatus::Open);
+  }
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+    ExpectBalance(engine, ticketx::UserId{100}, 500'000, 0);
+
+    const std::optional<ticketx::Event> event = engine.event(ticketx::EventId{10});
+    ASSERT_TRUE(event.has_value());
+    const ticketx::PrimarySaleCategory* standard = FindCategory(*event, "standard");
+    ASSERT_NE(standard, nullptr);
+    EXPECT_EQ(standard->remaining, 499U);
+
+    const std::optional<ticketx::Ticket> primary_ticket =
+        engine.active_ticket(ticketx::UserId{100}, ticketx::EventId{10});
+    ASSERT_TRUE(primary_ticket.has_value());
+    EXPECT_EQ(primary_ticket->id.value, 1U);
+
+    ASSERT_TRUE(engine.locked_ticket(ticketx::UserId{200}, ticketx::EventId{10}, "standard")
+                    .has_value());
+    ASSERT_TRUE(engine.best_ask(ticketx::EventId{10}, "standard").has_value());
+    EXPECT_EQ(engine.best_ask(ticketx::EventId{10}, "standard")->id.value, 20U);
+
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{300}, 1'100'000));
+    const ticketx::ExecutionReport report =
+        engine.place_market_order(MakeMarketOrder(21, 300, ticketx::Side::Buy));
+    ASSERT_EQ(report.status, ticketx::OrderStatus::Filled);
+    EXPECT_FALSE(engine.best_ask(ticketx::EventId{10}, "standard").has_value());
+    EXPECT_TRUE(engine.active_ticket(ticketx::UserId{300}, ticketx::EventId{10}).has_value());
+  }
+
+  const std::optional<ticketx::EventLog> loaded = ticketx::load_event_log(path);
+  ASSERT_TRUE(loaded.has_value());
+  ASSERT_FALSE(loaded->empty());
+  for (std::size_t i = 0; i < loaded->size(); ++i) {
+    EXPECT_EQ(loaded->at(i).sequence_id, i + 1);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(TicketXEngineTest, PathConstructorRestoresNextTicketIdFromRecoveredTickets) {
+  const std::filesystem::path path = TempEngineEventLogPath("restore_next_ticket");
+  std::filesystem::remove(path);
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.create_event(MakeEventDefinition()));
+    ASSERT_TRUE(engine.issue_ticket(MakeTicket(10, 200)));
+  }
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'000'000));
+    const ticketx::PrimaryBuyResult result =
+        engine.primary_buy(ticketx::UserId{100}, ticketx::EventId{10}, "standard");
+    ASSERT_EQ(result.status, ticketx::PrimaryBuyStatus::Accepted);
+    ASSERT_TRUE(result.ticket.has_value());
+    EXPECT_EQ(result.ticket->id.value, 11U);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(TicketXEngineTest, PathConstructorRestoresOpenOrderFifoAfterOrderIdReuse) {
+  const std::filesystem::path path = TempEngineEventLogPath("restore_reused_order_fifo");
+  std::filesystem::remove(path);
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'000'000));
+    ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(10, 100, ticketx::Side::Buy, 700'000))
+                  .status,
+              ticketx::OrderStatus::Open);
+    ASSERT_TRUE(engine.cancel_order(ticketx::OrderId{10}).has_value());
+
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{200}, 1'000'000));
+    ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(11, 200, ticketx::Side::Buy, 700'000))
+                  .status,
+              ticketx::OrderStatus::Open);
+
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{300}, 1'000'000));
+    ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(10, 300, ticketx::Side::Buy, 700'000))
+                  .status,
+              ticketx::OrderStatus::Open);
+  }
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+    ASSERT_TRUE(engine.best_bid(ticketx::EventId{10}, "standard").has_value());
+    EXPECT_EQ(engine.best_bid(ticketx::EventId{10}, "standard")->id.value, 11U);
+
+    ASSERT_TRUE(engine.cancel_order(ticketx::OrderId{11}).has_value());
+    ASSERT_TRUE(engine.best_bid(ticketx::EventId{10}, "standard").has_value());
+    EXPECT_EQ(engine.best_bid(ticketx::EventId{10}, "standard")->id.value, 10U);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(TicketXEngineTest, PathConstructorRestoresMarketBuyWithUnrelatedOpenBuyFunds) {
+  const std::filesystem::path path =
+      TempEngineEventLogPath("restore_market_buy_with_unrelated_lock");
+  std::filesystem::remove(path);
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 2'000'000));
+    ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(10, 100, ticketx::Side::Buy, 700'000))
+                  .status,
+              ticketx::OrderStatus::Open);
+
+    ASSERT_TRUE(engine.issue_ticket(MakeTicket(30, 200, 20, "premium")));
+    ASSERT_EQ(engine.place_limit_order(
+                         MakeLimitOrder(20, 200, ticketx::Side::Sell, 500'000, 20, "premium"))
+                  .status,
+              ticketx::OrderStatus::Open);
+
+    const ticketx::ExecutionReport trade_report =
+        engine.place_market_order(MakeMarketOrder(30, 100, ticketx::Side::Buy, 20, "premium"));
+    ASSERT_EQ(trade_report.status, ticketx::OrderStatus::Filled);
+  }
+
+  {
+    ticketx::TicketXEngine engine{path};
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+    ExpectBalance(engine, ticketx::UserId{100}, 800'000, 700'000);
+    ExpectBalance(engine, ticketx::UserId{200}, 500'000, 0);
+
+    ASSERT_TRUE(engine.best_bid(ticketx::EventId{10}, "standard").has_value());
+    EXPECT_EQ(engine.best_bid(ticketx::EventId{10}, "standard")->id.value, 10U);
+    EXPECT_FALSE(engine.best_ask(ticketx::EventId{20}, "premium").has_value());
+
+    const std::optional<ticketx::Ticket> buyer_ticket =
+        engine.active_ticket(ticketx::UserId{100}, ticketx::EventId{20});
+    ASSERT_TRUE(buyer_ticket.has_value());
+    EXPECT_EQ(buyer_ticket->id.value, 30U);
+    EXPECT_EQ(buyer_ticket->credential_version, 2U);
+  }
+
+  std::filesystem::remove(path);
+}
+
+TEST(TicketXEngineTest, PathConstructorReportsInvalidRecoveryLogAndDoesNotAppend) {
+  const std::filesystem::path path = TempEngineEventLogPath("invalid_recovery_log");
+  std::filesystem::remove(path);
+  ASSERT_TRUE(ticketx::append_event_record(
+      path, ticketx::EventRecord{
+                .sequence_id = 1,
+                .type = std::string{ticketx::event_type::WalletDeposited},
+                .payload_json = "{}",
+            }));
+
+  {
+    ticketx::TicketXEngine engine{path};
+    EXPECT_FALSE(engine.event_log_recovery_ok());
+    EXPECT_FALSE(engine.event_log_recovery_errors().empty());
+    EXPECT_TRUE(engine.event_log().empty());
+
+    EXPECT_FALSE(engine.deposit(ticketx::UserId{100}, 1'000));
+    EXPECT_FALSE(engine.create_event(MakeEventDefinition()));
+    EXPECT_FALSE(engine.issue_ticket(MakeTicket(10, 200)));
+    EXPECT_EQ(engine.place_limit_order(MakeLimitOrder(20, 100, ticketx::Side::Buy, 1'000))
+                  .status,
+              ticketx::OrderStatus::Rejected);
+  }
+
+  const std::optional<ticketx::EventLog> loaded = ticketx::load_event_log(path);
+  ASSERT_TRUE(loaded.has_value());
+  ASSERT_EQ(loaded->size(), 1U);
+  EXPECT_EQ(loaded->at(0).payload_json, "{}");
 
   std::filesystem::remove(path);
 }

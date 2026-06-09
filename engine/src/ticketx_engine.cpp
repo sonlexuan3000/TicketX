@@ -1,7 +1,10 @@
 #include "ticketx/ticketx_engine.hpp"
+#include "ticketx/event_replay.hpp"
+#include "ticketx/event_store.hpp"
 #include "ticketx/version.hpp"
 
 #include <cstddef>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -193,14 +196,156 @@ std::string TicketTransferPayload(const Trade& trade) {
          JsonString(trade.category) + "}";
 }
 
+std::optional<std::uint64_t> NextSequenceIdAfter(const EventLog& event_log) {
+  if (event_log.empty()) {
+    return 1;
+  }
+
+  if (event_log.back().sequence_id == std::numeric_limits<std::uint64_t>::max()) {
+    return std::nullopt;
+  }
+  return event_log.back().sequence_id + 1;
+}
+
 } // namespace
 
 static_assert(sizeof(Money) == sizeof(std::int64_t));
 
 TicketXEngine::TicketXEngine(std::filesystem::path event_log_path)
-    : event_writer_(std::make_unique<AsyncEventWriter>(std::move(event_log_path))) {}
+    : event_writer_(std::make_unique<AsyncEventWriter>(event_log_path)) {
+  if (!std::filesystem::exists(event_log_path)) {
+    return;
+  }
+
+  const std::optional<EventLog> persisted_event_log = load_event_log(event_log_path);
+  if (!persisted_event_log.has_value()) {
+    mark_recovery_failed({"failed to load existing event log"});
+    return;
+  }
+
+  RecoveryReport recovery_report = validate_recovery_log(*persisted_event_log);
+  if (!recovery_report.ok) {
+    mark_recovery_failed(std::move(recovery_report.errors));
+    return;
+  }
+
+  const std::optional<std::uint64_t> next_sequence_id =
+      NextSequenceIdAfter(*persisted_event_log);
+  if (!next_sequence_id.has_value()) {
+    mark_recovery_failed({"event sequence id overflow"});
+    return;
+  }
+
+  const ReplayState recovered_state = replay_state(*persisted_event_log);
+  if (!hydrate_from_replay_state(recovered_state)) {
+    mark_recovery_failed({"failed to hydrate recovered engine state"});
+    return;
+  }
+
+  event_log_ = *persisted_event_log;
+  next_event_sequence_id_ = *next_sequence_id;
+}
+
+bool TicketXEngine::accepts_commands() const noexcept { return event_log_recovery_ok_; }
+
+void TicketXEngine::mark_recovery_failed(std::vector<std::string> errors) {
+  event_log_recovery_ok_ = false;
+  event_log_recovery_errors_ = std::move(errors);
+  event_writer_.reset();
+
+  matching_engine_ = MatchingEngine{};
+  wallets_ = WalletLedger{};
+  tickets_ = TicketLedger{};
+  event_log_.clear();
+  events_.clear();
+  open_orders_.clear();
+  locked_buy_amounts_.clear();
+  next_ticket_id_ = 1;
+  next_event_sequence_id_ = 1;
+}
+
+bool TicketXEngine::hydrate_from_replay_state(const ReplayState& state) {
+  events_ = state.events;
+
+  for (const auto& [user_id, wallet] : state.wallets) {
+    if (wallet.available < 0 || wallet.locked < 0 ||
+        wallet.available > std::numeric_limits<Money>::max() - wallet.locked) {
+      return false;
+    }
+
+    const Money total = wallet.available + wallet.locked;
+    if (total > 0 && !wallets_.deposit(UserId{user_id}, total)) {
+      return false;
+    }
+    if (wallet.locked > 0 && !wallets_.lock_funds(UserId{user_id}, wallet.locked)) {
+      return false;
+    }
+  }
+
+  for (const auto& [unused_ticket_id, ticket] : state.tickets) {
+    (void)unused_ticket_id;
+    if (ticket.status != TicketStatus::Owned &&
+        ticket.status != TicketStatus::LockedForSell) {
+      return false;
+    }
+
+    Ticket owned_ticket = ticket;
+    owned_ticket.status = TicketStatus::Owned;
+    if (!tickets_.issue_ticket(owned_ticket)) {
+      return false;
+    }
+    if (ticket.status == TicketStatus::LockedForSell &&
+        !tickets_.lock_ticket(ticket.owner_user_id, ticket.event_id, ticket.category)
+             .has_value()) {
+      return false;
+    }
+  }
+
+  if (state.max_ticket_id == std::numeric_limits<std::uint64_t>::max()) {
+    return false;
+  }
+  next_ticket_id_ = state.max_ticket_id + 1;
+
+  std::unordered_set<std::uint64_t> hydrated_order_ids;
+  for (const std::uint64_t order_id : state.open_order_sequence) {
+    const auto order_it = state.open_orders.find(order_id);
+    if (order_it == state.open_orders.end() ||
+        !hydrated_order_ids.insert(order_id).second) {
+      continue;
+    }
+
+    const Order& order = order_it->second;
+    if (!IsValidLimitOrder(order) || order.status != OrderStatus::Open ||
+        order.category.empty()) {
+      return false;
+    }
+
+    if (order.side == Side::Buy) {
+      const WalletBalance balance = wallets_.balance(order.user_id);
+      if (!order.limit_price.has_value() || balance.locked < *order.limit_price) {
+        return false;
+      }
+      locked_buy_amounts_.emplace(order.id.value, *order.limit_price);
+    } else if (!tickets_.locked_ticket(order.user_id, order.event_id, order.category)
+                    .has_value()) {
+      return false;
+    }
+
+    const ExecutionReport report = matching_engine_.place_limit_order(order);
+    if (report.status != OrderStatus::Open || report.trade.has_value()) {
+      return false;
+    }
+    open_orders_.emplace(order.id.value, order);
+  }
+
+  return hydrated_order_ids.size() == state.open_orders.size();
+}
 
 bool TicketXEngine::create_event(Event event) {
+  if (!accepts_commands()) {
+    return false;
+  }
+
   if (event.name.empty() || event.categories.empty() || events_.contains(event.id.value)) {
     return false;
   }
@@ -250,6 +395,12 @@ const PrimarySaleCategory* TicketXEngine::find_category(const Event& event,
 
 PrimaryBuyResult TicketXEngine::primary_buy(UserId user_id, EventId event_id,
                                             const std::string& category) {
+  if (!accepts_commands()) {
+    return PrimaryBuyResult{
+        .status = PrimaryBuyStatus::TicketIssueFailed,
+    };
+  }
+
   const auto event_it = events_.find(event_id.value);
   if (event_it == events_.end()) {
     return PrimaryBuyResult{
@@ -306,6 +457,10 @@ PrimaryBuyResult TicketXEngine::primary_buy(UserId user_id, EventId event_id,
 }
 
 bool TicketXEngine::deposit(UserId user_id, Money amount) {
+  if (!accepts_commands()) {
+    return false;
+  }
+
   if (!wallets_.deposit(user_id, amount)) {
     return false;
   }
@@ -314,6 +469,10 @@ bool TicketXEngine::deposit(UserId user_id, Money amount) {
 }
 
 bool TicketXEngine::issue_ticket(Ticket ticket) {
+  if (!accepts_commands()) {
+    return false;
+  }
+
   if (has_open_buy_for_event(ticket.owner_user_id, ticket.event_id)) {
     return false;
   }
@@ -343,6 +502,10 @@ std::optional<Ticket> TicketXEngine::locked_ticket(UserId user_id, EventId event
 }
 
 ExecutionReport TicketXEngine::place_limit_order(Order order) {
+  if (!accepts_commands()) {
+    return RejectedReportFor(order);
+  }
+
   if (!IsValidLimitOrder(order) || order.category.empty() || open_orders_.contains(order.id.value)) {
     return RejectedReportFor(order);
   }
@@ -424,6 +587,10 @@ ExecutionReport TicketXEngine::place_sell_limit(Order order) {
 }
 
 ExecutionReport TicketXEngine::place_market_order(Order order) {
+  if (!accepts_commands()) {
+    return RejectedReportFor(order);
+  }
+
   if (!IsValidMarketOrder(order) || open_orders_.contains(order.id.value)) {
     return RejectedReportFor(order);
   }
@@ -479,6 +646,10 @@ ExecutionReport TicketXEngine::place_market_sell(Order order) {
 }
 
 std::optional<Order> TicketXEngine::cancel_order(OrderId order_id) {
+  if (!accepts_commands()) {
+    return std::nullopt;
+  }
+
   const auto open_order_it = open_orders_.find(order_id.value);
   if (open_order_it == open_orders_.end()) {
     return std::nullopt;
