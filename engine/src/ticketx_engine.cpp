@@ -1,7 +1,9 @@
 #include "ticketx/ticketx_engine.hpp"
 #include "ticketx/version.hpp"
 
+#include <cstddef>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -27,8 +29,112 @@ bool IsValidMarketOrder(const Order& order) {
   return order.type == OrderType::Market && !order.category.empty();
 }
 
-std::string EventPayload(EventId event_id) {
-  return "{\"event_id\":" + std::to_string(event_id.value) + "}";
+std::string JsonString(const std::string& value) {
+  std::string escaped{"\""};
+  constexpr char kHex[] = "0123456789abcdef";
+  for (const unsigned char ch : value) {
+    switch (ch) {
+    case '"':
+      escaped += "\\\"";
+      break;
+    case '\\':
+      escaped += "\\\\";
+      break;
+    case '\b':
+      escaped += "\\b";
+      break;
+    case '\f':
+      escaped += "\\f";
+      break;
+    case '\n':
+      escaped += "\\n";
+      break;
+    case '\r':
+      escaped += "\\r";
+      break;
+    case '\t':
+      escaped += "\\t";
+      break;
+    default:
+      if (ch < 0x20) {
+        escaped += "\\u00";
+        escaped.push_back(kHex[ch >> 4]);
+        escaped.push_back(kHex[ch & 0x0F]);
+      } else {
+        escaped.push_back(static_cast<char>(ch));
+      }
+    }
+  }
+  escaped.push_back('"');
+  return escaped;
+}
+
+std::string_view SideName(Side side) {
+  switch (side) {
+  case Side::Buy:
+    return "Buy";
+  case Side::Sell:
+    return "Sell";
+  }
+  return "Unknown";
+}
+
+std::string_view OrderTypeName(OrderType type) {
+  switch (type) {
+  case OrderType::Limit:
+    return "Limit";
+  case OrderType::Market:
+    return "Market";
+  }
+  return "Unknown";
+}
+
+std::string_view OrderStatusName(OrderStatus status) {
+  switch (status) {
+  case OrderStatus::Accepted:
+    return "Accepted";
+  case OrderStatus::Rejected:
+    return "Rejected";
+  case OrderStatus::Open:
+    return "Open";
+  case OrderStatus::Filled:
+    return "Filled";
+  case OrderStatus::Cancelled:
+    return "Cancelled";
+  }
+  return "Unknown";
+}
+
+std::string_view TicketStatusName(TicketStatus status) {
+  switch (status) {
+  case TicketStatus::Owned:
+    return "Owned";
+  case TicketStatus::LockedForSell:
+    return "LockedForSell";
+  case TicketStatus::Transferred:
+    return "Transferred";
+  case TicketStatus::Used:
+    return "Used";
+  case TicketStatus::Revoked:
+    return "Revoked";
+  }
+  return "Unknown";
+}
+
+std::string EventPayload(const Event& event) {
+  std::string payload = "{\"event_id\":" + std::to_string(event.id.value) + ",\"name\":" +
+                        JsonString(event.name) + ",\"categories\":[";
+  for (std::size_t i = 0; i < event.categories.size(); ++i) {
+    const PrimarySaleCategory& category = event.categories[i];
+    if (i > 0) {
+      payload += ",";
+    }
+    payload += "{\"name\":" + JsonString(category.name) + ",\"price\":" +
+               std::to_string(category.price) + ",\"remaining\":" +
+               std::to_string(category.remaining) + "}";
+  }
+  payload += "]}";
+  return payload;
 }
 
 std::string DepositPayload(UserId user_id, Money amount) {
@@ -36,39 +142,63 @@ std::string DepositPayload(UserId user_id, Money amount) {
          std::to_string(amount) + "}";
 }
 
+std::string TicketPayload(const Ticket& ticket) {
+  return "{\"ticket_id\":" + std::to_string(ticket.id.value) + ",\"owner_user_id\":" +
+         std::to_string(ticket.owner_user_id.value) + ",\"event_id\":" +
+         std::to_string(ticket.event_id.value) + ",\"category\":" +
+         JsonString(ticket.category) + ",\"status\":" +
+         JsonString(std::string{TicketStatusName(ticket.status)}) + ",\"credential_version\":" +
+         std::to_string(ticket.credential_version) + "}";
+}
+
 std::string PrimaryBuyPayload(const Ticket& ticket, Money price) {
   return "{\"ticket_id\":" + std::to_string(ticket.id.value) + ",\"buyer_user_id\":" +
          std::to_string(ticket.owner_user_id.value) + ",\"event_id\":" +
-         std::to_string(ticket.event_id.value) + ",\"price\":" + std::to_string(price) + "}";
+         std::to_string(ticket.event_id.value) + ",\"category\":" +
+         JsonString(ticket.category) + ",\"price\":" + std::to_string(price) +
+         ",\"credential_version\":" + std::to_string(ticket.credential_version) + "}";
 }
 
 std::string OrderPayload(const Order& order) {
   return "{\"order_id\":" + std::to_string(order.id.value) + ",\"user_id\":" +
          std::to_string(order.user_id.value) + ",\"event_id\":" +
-         std::to_string(order.event_id.value) + "}";
+         std::to_string(order.event_id.value) + ",\"category\":" +
+         JsonString(order.category) + ",\"side\":" +
+         JsonString(std::string{SideName(order.side)}) + ",\"type\":" +
+         JsonString(std::string{OrderTypeName(order.type)}) + ",\"limit_price\":" +
+         (order.limit_price.has_value() ? std::to_string(*order.limit_price) : "null") +
+         ",\"status\":" + JsonString(std::string{OrderStatusName(order.status)}) + "}";
 }
 
 std::string MatchPayload(const Trade& trade) {
   return "{\"buy_order_id\":" + std::to_string(trade.buy_order_id.value) +
-         ",\"sell_order_id\":" + std::to_string(trade.sell_order_id.value) + ",\"price\":" +
-         std::to_string(trade.price) + "}";
+         ",\"sell_order_id\":" + std::to_string(trade.sell_order_id.value) +
+         ",\"buyer_user_id\":" + std::to_string(trade.buyer_user_id.value) +
+         ",\"seller_user_id\":" + std::to_string(trade.seller_user_id.value) +
+         ",\"event_id\":" + std::to_string(trade.event_id.value) + ",\"category\":" +
+         JsonString(trade.category) + ",\"price\":" + std::to_string(trade.price) + "}";
 }
 
 std::string WalletSettlementPayload(const Trade& trade) {
   return "{\"buyer_user_id\":" + std::to_string(trade.buyer_user_id.value) +
          ",\"seller_user_id\":" + std::to_string(trade.seller_user_id.value) +
-         ",\"price\":" + std::to_string(trade.price) + "}";
+         ",\"event_id\":" + std::to_string(trade.event_id.value) + ",\"category\":" +
+         JsonString(trade.category) + ",\"price\":" + std::to_string(trade.price) + "}";
 }
 
 std::string TicketTransferPayload(const Trade& trade) {
   return "{\"buyer_user_id\":" + std::to_string(trade.buyer_user_id.value) +
          ",\"seller_user_id\":" + std::to_string(trade.seller_user_id.value) +
-         ",\"event_id\":" + std::to_string(trade.event_id.value) + "}";
+         ",\"event_id\":" + std::to_string(trade.event_id.value) + ",\"category\":" +
+         JsonString(trade.category) + "}";
 }
 
 } // namespace
 
 static_assert(sizeof(Money) == sizeof(std::int64_t));
+
+TicketXEngine::TicketXEngine(std::filesystem::path event_log_path)
+    : event_writer_(std::make_unique<AsyncEventWriter>(std::move(event_log_path))) {}
 
 bool TicketXEngine::create_event(Event event) {
   if (event.name.empty() || event.categories.empty() || events_.contains(event.id.value)) {
@@ -85,9 +215,9 @@ bool TicketXEngine::create_event(Event event) {
     }
   }
 
-  const EventId event_id = event.id;
+  std::string payload = EventPayload(event);
   events_.emplace(event.id.value, std::move(event));
-  append_event(event_type::EventCreated, EventPayload(event_id));
+  append_event(event_type::EventCreated, std::move(payload));
   return true;
 }
 
@@ -187,7 +317,11 @@ bool TicketXEngine::issue_ticket(Ticket ticket) {
   if (has_open_buy_for_event(ticket.owner_user_id, ticket.event_id)) {
     return false;
   }
-  return tickets_.issue_ticket(std::move(ticket));
+  if (!tickets_.issue_ticket(ticket)) {
+    return false;
+  }
+  append_event(event_type::TicketIssued, TicketPayload(ticket));
+  return true;
 }
 
 WalletBalance TicketXEngine::wallet_balance(UserId user_id) const {
@@ -221,7 +355,8 @@ ExecutionReport TicketXEngine::place_limit_order(Order order) {
 }
 
 ExecutionReport TicketXEngine::place_buy_limit(Order order, Money limit_price) {
-  if (tickets_.owns_active_ticket(order.user_id, order.event_id)) {
+  if (tickets_.owns_active_ticket(order.user_id, order.event_id) ||
+      has_open_buy_for_event(order.user_id, order.event_id)) {
     return RejectedReportFor(order);
   }
   if (!wallets_.lock_funds(order.user_id, limit_price)) {
@@ -475,10 +610,15 @@ void TicketXEngine::clear_filled_orders(const Trade& trade) {
 }
 
 void TicketXEngine::append_event(std::string_view type, std::string payload_json) {
-  event_log_.push_back(EventRecord{
+  EventRecord record{
+      .sequence_id = next_event_sequence_id_++,
       .type = std::string{type},
       .payload_json = std::move(payload_json),
-  });
+  };
+  event_log_.push_back(record);
+  if (event_writer_ != nullptr) {
+    (void)event_writer_->enqueue(std::move(record));
+  }
 }
 
 void TicketXEngine::append_trade_events(const Trade& trade) {
@@ -492,8 +632,19 @@ bool TicketXEngine::can_settle_locked_buyer_trade(const Trade& trade) const {
   if (locked_it == locked_buy_amounts_.end() || locked_it->second < trade.price) {
     return false;
   }
-  return can_credit(trade.seller_user_id, trade.price) && can_transfer_ticket(trade) &&
-         wallets_.balance(trade.buyer_user_id).locked >= locked_it->second;
+
+  const Money locked_amount = locked_it->second;
+  const Money refund = locked_amount - trade.price;
+  const WalletBalance buyer_balance = wallets_.balance(trade.buyer_user_id);
+  if (buyer_balance.locked < locked_amount) {
+    return false;
+  }
+  if (refund > 0 &&
+      buyer_balance.available > std::numeric_limits<Money>::max() - refund) {
+    return false;
+  }
+
+  return can_credit(trade.seller_user_id, trade.price) && can_transfer_ticket(trade);
 }
 
 bool TicketXEngine::can_settle_market_buy_trade(const Trade& trade) const {

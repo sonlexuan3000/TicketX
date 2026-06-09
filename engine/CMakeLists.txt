@@ -1,5 +1,8 @@
 add_library(ticketx_engine
+  src/async_event_writer.cpp
+  src/event_store.cpp
   src/ticketx_engine.cpp
+  src/event_replay.cpp
   src/matching_engine.cpp
   src/order_book.cpp
   src/ticket_ledger.cpp
@@ -9,6 +12,11 @@ add_library(ticketx_engine
 target_include_directories(ticketx_engine
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(ticketx_engine
+  PRIVATE
+    nlohmann_json::nlohmann_json
 )
 
 target_compile_features(ticketx_engine PUBLIC cxx_std_20)

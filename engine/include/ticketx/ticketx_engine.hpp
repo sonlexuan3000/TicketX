@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ticketx/async_event_writer.hpp"
 #include "ticketx/event.hpp"
 #include "ticketx/event_log.hpp"
 #include "ticketx/matching_engine.hpp"
@@ -7,6 +8,8 @@
 #include "ticketx/wallet_ledger.hpp"
 
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -16,6 +19,9 @@ namespace ticketx {
 
 class TicketXEngine {
 public:
+  TicketXEngine() = default;
+  explicit TicketXEngine(std::filesystem::path event_log_path);
+
   bool create_event(Event event);
   std::optional<Event> event(EventId event_id) const;
   PrimaryBuyResult primary_buy(UserId user_id, EventId event_id, const std::string& category);
@@ -43,10 +49,12 @@ private:
   WalletLedger wallets_;
   TicketLedger tickets_;
   EventLog event_log_;
+  std::unique_ptr<AsyncEventWriter> event_writer_;
   std::unordered_map<std::uint64_t, Event> events_;
   std::unordered_map<std::uint64_t, Order> open_orders_;
   std::unordered_map<std::uint64_t, Money> locked_buy_amounts_;
   std::uint64_t next_ticket_id_{1};
+  std::uint64_t next_event_sequence_id_{1};
 
   ExecutionReport place_buy_limit(Order order, Money limit_price);
   ExecutionReport place_sell_limit(Order order);

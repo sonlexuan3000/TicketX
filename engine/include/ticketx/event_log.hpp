@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include <string>
 #include <string_view>
 #include <vector>
@@ -7,6 +9,7 @@
 namespace ticketx {
 
 struct EventRecord {
+  std::uint64_t sequence_id;
   std::string type;
   std::string payload_json;
 };
@@ -17,6 +20,7 @@ namespace event_type {
 
 inline constexpr std::string_view EventCreated{"EventCreated"};
 inline constexpr std::string_view WalletDeposited{"WalletDeposited"};
+inline constexpr std::string_view TicketIssued{"TicketIssued"};
 inline constexpr std::string_view PrimaryTicketBought{"PrimaryTicketBought"};
 inline constexpr std::string_view OrderPlaced{"OrderPlaced"};
 inline constexpr std::string_view OrderCancelled{"OrderCancelled"};

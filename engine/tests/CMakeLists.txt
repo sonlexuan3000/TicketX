@@ -1,5 +1,8 @@
 add_executable(ticketx_engine_tests
   smoke_test.cpp
+  async_event_writer_test.cpp
+  event_replay_test.cpp
+  event_store_test.cpp
   order_book_test.cpp
   matching_engine_test.cpp
   primary_sale_test.cpp
