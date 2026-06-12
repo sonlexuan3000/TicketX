@@ -57,6 +57,7 @@ struct ReplayLoadResult {
 
 ReplaySummary replay_summary(const EventLog& event_log);
 ReplayState replay_state(const EventLog& event_log);
+ReplayState replay_state_from(ReplayState initial_state, const EventLog& event_log);
 RecoveryReport validate_recovery_log(const EventLog& event_log);
 ReplayLoadResult load_replay_state_from_event_log_file(const std::filesystem::path& path);
 

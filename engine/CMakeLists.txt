@@ -1,6 +1,7 @@
 add_library(ticketx_engine
   src/async_event_writer.cpp
   src/event_store.cpp
+  src/snapshot_store.cpp
   src/ticketx_engine.cpp
   src/event_replay.cpp
   src/matching_engine.cpp

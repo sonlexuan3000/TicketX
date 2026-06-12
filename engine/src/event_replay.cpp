@@ -319,6 +319,15 @@ bool CanAddMoney(Money current, Money amount) {
   return amount >= 0 && current <= std::numeric_limits<Money>::max() - amount;
 }
 
+bool AddSizeCounter(std::size_t& current, std::size_t amount) {
+  if (current > std::numeric_limits<std::size_t>::max() - amount) {
+    current = std::numeric_limits<std::size_t>::max();
+    return false;
+  }
+  current += amount;
+  return true;
+}
+
 bool CanSubtractMoney(Money current, Money amount) {
   return amount >= 0 && current >= amount;
 }
@@ -1005,6 +1014,44 @@ void UpdateTradeGroupIntegrity(const EventLog& event_log, ReplaySummary& summary
   }
 }
 
+ReplaySummary MergeReplaySummary(const ReplaySummary& base, const EventLog& event_log) {
+  if (event_log.empty()) {
+    return base;
+  }
+
+  const ReplaySummary tail = replay_summary(event_log);
+  ReplaySummary merged = base;
+  bool counters_valid = AddSizeCounter(merged.event_count, tail.event_count);
+  counters_valid = AddSizeCounter(merged.order_placed_count, tail.order_placed_count) &&
+                   counters_valid;
+  counters_valid = AddSizeCounter(merged.order_cancelled_count, tail.order_cancelled_count) &&
+                   counters_valid;
+  counters_valid = AddSizeCounter(merged.trade_count, tail.trade_count) && counters_valid;
+  if (CanAddMoney(merged.wallet_settled_amount, tail.wallet_settled_amount)) {
+    merged.wallet_settled_amount += tail.wallet_settled_amount;
+  } else {
+    counters_valid = false;
+  }
+  counters_valid = AddSizeCounter(merged.ticket_transfer_count, tail.ticket_transfer_count) &&
+                   counters_valid;
+  merged.last_sequence_id = tail.last_sequence_id;
+
+  const bool empty_base = base.event_count == 0 && base.last_sequence_id == 0;
+  const bool tail_connects =
+      empty_base || (base.event_count > 0 &&
+                     base.last_sequence_id != std::numeric_limits<std::uint64_t>::max() &&
+                     event_log.front().sequence_id == base.last_sequence_id + 1);
+  merged.sequence_contiguous =
+      counters_valid && base.sequence_contiguous && tail.sequence_contiguous && tail_connects;
+  counters_valid =
+      AddSizeCounter(merged.incomplete_trade_group_count,
+                     tail.incomplete_trade_group_count) &&
+      counters_valid;
+  merged.trade_groups_complete =
+      counters_valid && base.trade_groups_complete && tail.trade_groups_complete;
+  return merged;
+}
+
 } // namespace
 
 ReplaySummary replay_summary(const EventLog& event_log) {
@@ -1045,7 +1092,11 @@ ReplaySummary replay_summary(const EventLog& event_log) {
 }
 
 ReplayState replay_state(const EventLog& event_log) {
-  ReplayState state{.summary = replay_summary(event_log)};
+  return replay_state_from(ReplayState{}, event_log);
+}
+
+ReplayState replay_state_from(ReplayState state, const EventLog& event_log) {
+  state.summary = MergeReplaySummary(state.summary, event_log);
 
   for (std::size_t index = 0; index < event_log.size(); ++index) {
     const EventRecord& event = event_log[index];
