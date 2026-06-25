@@ -882,9 +882,8 @@ bool ValidateAndApplyTradeGroup(ReplayState& state, const Trade& trade) {
   return true;
 }
 
-void ValidateStateTransitions(const EventLog& event_log, RecoveryReport& report) {
-  ReplayState state{.summary = replay_summary(event_log)};
-
+void ValidateStateTransitionsFrom(ReplayState state, const EventLog& event_log,
+                                  RecoveryReport& report) {
   for (std::size_t index = 0; index < event_log.size(); ++index) {
     const EventRecord& event = event_log[index];
     if (!IsKnownEventType(event.type)) {
@@ -960,6 +959,10 @@ void ValidateStateTransitions(const EventLog& event_log, RecoveryReport& report)
       }
     }
   }
+}
+
+void ValidateStateTransitions(const EventLog& event_log, RecoveryReport& report) {
+  ValidateStateTransitionsFrom(ReplayState{}, event_log, report);
 }
 
 void ValidateTradeGroupConsistency(const EventLog& event_log, RecoveryReport& report) {
@@ -1247,6 +1250,59 @@ RecoveryReport validate_recovery_log(const EventLog& event_log) {
   }
   ValidateTradeGroupConsistency(event_log, report);
   ValidateStateTransitions(event_log, report);
+
+  report.ok = report.errors.empty();
+  return report;
+}
+
+RecoveryReport validate_recovery_log_from(const ReplayState& initial_state,
+                                          const EventLog& event_log) {
+  RecoveryReport report{
+      .ok = true,
+      .event_count = event_log.size(),
+  };
+
+  std::uint64_t expected_sequence_id = initial_state.summary.last_sequence_id;
+  if (!event_log.empty()) {
+    if (expected_sequence_id == std::numeric_limits<std::uint64_t>::max()) {
+      report.errors.push_back("sequence id overflow after snapshot");
+    } else {
+      ++expected_sequence_id;
+    }
+  }
+
+  for (const EventRecord& event : event_log) {
+    if (event.sequence_id != expected_sequence_id) {
+      report.errors.push_back("sequence gap or out-of-order event at " + EventContext(event) +
+                              "; expected sequence_id=" +
+                              std::to_string(expected_sequence_id));
+    }
+    if (expected_sequence_id < std::numeric_limits<std::uint64_t>::max()) {
+      ++expected_sequence_id;
+    }
+
+    if (!IsKnownEventType(event.type)) {
+      report.errors.push_back("unknown event type at " + EventContext(event));
+      continue;
+    }
+
+    const std::optional<nlohmann::json> payload = ParsePayload(event.payload_json);
+    if (!payload.has_value()) {
+      report.errors.push_back("malformed payload at " + EventContext(event));
+      continue;
+    }
+    if (!IsValidEventPayload(event, *payload)) {
+      report.errors.push_back("invalid payload shape at " + EventContext(event));
+    }
+  }
+
+  const ReplaySummary summary = replay_summary(event_log);
+  if (!summary.trade_groups_complete) {
+    report.errors.push_back("incomplete trade group count=" +
+                            std::to_string(summary.incomplete_trade_group_count));
+  }
+  ValidateTradeGroupConsistency(event_log, report);
+  ValidateStateTransitionsFrom(initial_state, event_log, report);
 
   report.ok = report.errors.empty();
   return report;

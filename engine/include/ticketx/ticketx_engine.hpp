@@ -24,6 +24,7 @@ class TicketXEngine {
 public:
   TicketXEngine() = default;
   explicit TicketXEngine(std::filesystem::path event_log_path);
+  TicketXEngine(std::filesystem::path event_log_path, std::filesystem::path snapshot_path);
 
   bool create_event(Event event);
   std::optional<Event> event(EventId event_id) const;
@@ -86,7 +87,12 @@ private:
   std::optional<Trade> preview_limit_trade(const Order& order) const;
   std::optional<Trade> preview_market_trade(const Order& order) const;
   bool accepts_commands() const noexcept;
+  void clear_runtime_state();
   void mark_recovery_failed(std::vector<std::string> errors);
+  bool recover_from_event_log_file(const std::filesystem::path& event_log_path);
+  bool recover_from_snapshot_file(const std::filesystem::path& event_log_path,
+                                  const std::filesystem::path& snapshot_path,
+                                  std::vector<std::string>& errors);
   bool hydrate_from_replay_state(const ReplayState& state);
 };
 

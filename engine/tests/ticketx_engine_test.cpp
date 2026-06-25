@@ -1,10 +1,13 @@
 #include "ticketx/ticketx_engine.hpp"
+#include "ticketx/event_replay.hpp"
 #include "ticketx/event_store.hpp"
+#include "ticketx/snapshot_store.hpp"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <string>
@@ -101,6 +104,30 @@ std::filesystem::path TempEngineEventLogPath(std::string name) {
   const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
   return std::filesystem::temp_directory_path() /
          ("ticketx_engine_" + std::move(name) + "_" + std::to_string(suffix) + ".jsonl");
+}
+
+std::filesystem::path TempEngineSnapshotPath(std::string name) {
+  const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+  return std::filesystem::temp_directory_path() /
+         ("ticketx_engine_" + std::move(name) + "_" + std::to_string(suffix) + ".snapshot");
+}
+
+ticketx::Snapshot SnapshotFromLog(const ticketx::EventLog& event_log) {
+  const ticketx::ReplayState state = ticketx::replay_state(event_log);
+  return ticketx::Snapshot{
+      .last_sequence_id = state.summary.last_sequence_id,
+      .state = state,
+  };
+}
+
+bool HasRecoveryErrorContaining(const ticketx::TicketXEngine& engine,
+                                const std::string& text) {
+  for (const std::string& error : engine.event_log_recovery_errors()) {
+    if (error.find(text) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
 }
 
 } // namespace
@@ -549,6 +576,163 @@ TEST(TicketXEngineTest, PathConstructorRestoresMarketBuyWithUnrelatedOpenBuyFund
   }
 
   std::filesystem::remove(path);
+}
+
+TEST(TicketXEngineTest, SnapshotConstructorRestoresSnapshotAndTailLogState) {
+  const std::filesystem::path event_log_path =
+      TempEngineEventLogPath("snapshot_tail_restore");
+  const std::filesystem::path snapshot_path =
+      TempEngineSnapshotPath("snapshot_tail_restore");
+  std::filesystem::remove(event_log_path);
+  std::filesystem::remove(snapshot_path);
+
+  {
+    ticketx::TicketXEngine engine{event_log_path};
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 2'000'000));
+    ASSERT_EQ(engine.place_limit_order(MakeLimitOrder(10, 100, ticketx::Side::Buy, 700'000))
+                  .status,
+              ticketx::OrderStatus::Open);
+    ASSERT_TRUE(ticketx::save_snapshot(snapshot_path, SnapshotFromLog(engine.event_log())));
+
+    ASSERT_TRUE(engine.issue_ticket(MakeTicket(30, 200, 20, "premium")));
+    ASSERT_EQ(engine.place_limit_order(
+                       MakeLimitOrder(20, 200, ticketx::Side::Sell, 500'000, 20, "premium"))
+                  .status,
+              ticketx::OrderStatus::Open);
+    ASSERT_EQ(engine.place_market_order(MakeMarketOrder(30, 100, ticketx::Side::Buy, 20,
+                                                        "premium"))
+                  .status,
+              ticketx::OrderStatus::Filled);
+  }
+
+  {
+    ticketx::TicketXEngine engine{event_log_path, snapshot_path};
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+
+    ExpectBalance(engine, ticketx::UserId{100}, 800'000, 700'000);
+    ExpectBalance(engine, ticketx::UserId{200}, 500'000, 0);
+    ASSERT_TRUE(engine.best_bid(ticketx::EventId{10}, "standard").has_value());
+    EXPECT_EQ(engine.best_bid(ticketx::EventId{10}, "standard")->id.value, 10U);
+    EXPECT_FALSE(engine.best_ask(ticketx::EventId{20}, "premium").has_value());
+
+    const std::optional<ticketx::Ticket> buyer_ticket =
+        engine.active_ticket(ticketx::UserId{100}, ticketx::EventId{20});
+    ASSERT_TRUE(buyer_ticket.has_value());
+    EXPECT_EQ(buyer_ticket->id.value, 30U);
+    EXPECT_EQ(buyer_ticket->credential_version, 2U);
+
+    ASSERT_EQ(engine.event_log().size(), 7U);
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{300}, 123'000));
+    ASSERT_EQ(engine.event_log().size(), 8U);
+    EXPECT_EQ(engine.event_log().back().sequence_id, 8U);
+  }
+
+  std::filesystem::remove(event_log_path);
+  std::filesystem::remove(snapshot_path);
+}
+
+TEST(TicketXEngineTest, SnapshotConstructorRestoresSnapshotWithoutEventLogFile) {
+  const std::filesystem::path event_log_path =
+      TempEngineEventLogPath("snapshot_without_log");
+  const std::filesystem::path snapshot_path =
+      TempEngineSnapshotPath("snapshot_without_log");
+  std::filesystem::remove(event_log_path);
+  std::filesystem::remove(snapshot_path);
+
+  {
+    ticketx::TicketXEngine source_engine;
+    ASSERT_TRUE(source_engine.deposit(ticketx::UserId{100}, 1'000'000));
+    ASSERT_TRUE(source_engine.issue_ticket(MakeTicket(30, 200)));
+    ASSERT_TRUE(ticketx::save_snapshot(snapshot_path,
+                                       SnapshotFromLog(source_engine.event_log())));
+  }
+
+  {
+    ticketx::TicketXEngine engine{event_log_path, snapshot_path};
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+    ExpectBalance(engine, ticketx::UserId{100}, 1'000'000, 0);
+    ASSERT_TRUE(engine.active_ticket(ticketx::UserId{200}, ticketx::EventId{10})
+                    .has_value());
+    EXPECT_TRUE(engine.event_log().empty());
+
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{300}, 123'000));
+    ASSERT_EQ(engine.event_log().size(), 1U);
+    EXPECT_EQ(engine.event_log().back().sequence_id, 3U);
+  }
+
+  const std::optional<ticketx::EventLog> persisted_log =
+      ticketx::load_event_log(event_log_path);
+  ASSERT_TRUE(persisted_log.has_value());
+  ASSERT_EQ(persisted_log->size(), 1U);
+  EXPECT_EQ(persisted_log->front().sequence_id, 3U);
+
+  std::filesystem::remove(event_log_path);
+  std::filesystem::remove(snapshot_path);
+}
+
+TEST(TicketXEngineTest, SnapshotConstructorRejectsInvalidTailLog) {
+  const std::filesystem::path event_log_path =
+      TempEngineEventLogPath("snapshot_invalid_tail");
+  const std::filesystem::path snapshot_path =
+      TempEngineSnapshotPath("snapshot_invalid_tail");
+  std::filesystem::remove(event_log_path);
+  std::filesystem::remove(snapshot_path);
+
+  const ticketx::EventLog snapshot_log{
+      ticketx::EventRecord{
+          .sequence_id = 1,
+          .type = std::string{ticketx::event_type::WalletDeposited},
+          .payload_json = "{\"user_id\":100,\"amount\":1000000}",
+      },
+  };
+  ASSERT_TRUE(ticketx::save_snapshot(snapshot_path, SnapshotFromLog(snapshot_log)));
+  ASSERT_TRUE(ticketx::append_event_record(
+      event_log_path, ticketx::EventRecord{
+                          .sequence_id = 3,
+                          .type = std::string{ticketx::event_type::WalletDeposited},
+                          .payload_json = "{\"user_id\":200,\"amount\":1000000}",
+                      }));
+
+  ticketx::TicketXEngine engine{event_log_path, snapshot_path};
+  EXPECT_FALSE(engine.event_log_recovery_ok());
+  EXPECT_TRUE(HasRecoveryErrorContaining(engine, "sequence gap"));
+  EXPECT_TRUE(engine.event_log().empty());
+  EXPECT_FALSE(engine.deposit(ticketx::UserId{300}, 123'000));
+
+  std::filesystem::remove(event_log_path);
+  std::filesystem::remove(snapshot_path);
+}
+
+TEST(TicketXEngineTest, SnapshotConstructorFallsBackToFullLogWhenSnapshotIsInvalid) {
+  const std::filesystem::path event_log_path =
+      TempEngineEventLogPath("snapshot_invalid_fallback");
+  const std::filesystem::path snapshot_path =
+      TempEngineSnapshotPath("snapshot_invalid_fallback");
+  std::filesystem::remove(event_log_path);
+  std::filesystem::remove(snapshot_path);
+
+  {
+    ticketx::TicketXEngine engine{event_log_path};
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{100}, 1'000'000));
+  }
+  {
+    std::ofstream snapshot_output{snapshot_path};
+    ASSERT_TRUE(snapshot_output.is_open());
+    snapshot_output << "{not json}\n";
+  }
+
+  {
+    ticketx::TicketXEngine engine{event_log_path, snapshot_path};
+    ASSERT_TRUE(engine.event_log_recovery_ok());
+    ExpectBalance(engine, ticketx::UserId{100}, 1'000'000, 0);
+
+    ASSERT_TRUE(engine.deposit(ticketx::UserId{200}, 2'000'000));
+    ASSERT_EQ(engine.event_log().size(), 2U);
+    EXPECT_EQ(engine.event_log().back().sequence_id, 2U);
+  }
+
+  std::filesystem::remove(event_log_path);
+  std::filesystem::remove(snapshot_path);
 }
 
 TEST(TicketXEngineTest, PathConstructorReportsInvalidRecoveryLogAndDoesNotAppend) {

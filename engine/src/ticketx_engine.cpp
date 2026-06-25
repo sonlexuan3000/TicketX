@@ -1,6 +1,7 @@
 #include "ticketx/ticketx_engine.hpp"
 #include "ticketx/event_replay.hpp"
 #include "ticketx/event_store.hpp"
+#include "ticketx/snapshot_store.hpp"
 #include "ticketx/version.hpp"
 
 #include <cstddef>
@@ -207,52 +208,163 @@ std::optional<std::uint64_t> NextSequenceIdAfter(const EventLog& event_log) {
   return event_log.back().sequence_id + 1;
 }
 
+std::optional<EventLog> TailEventsAfterSnapshot(const EventLog& event_log,
+                                                std::uint64_t snapshot_sequence_id) {
+  EventLog tail;
+  bool saw_tail_event = false;
+  for (const EventRecord& event : event_log) {
+    if (event.sequence_id > snapshot_sequence_id) {
+      saw_tail_event = true;
+      tail.push_back(event);
+      continue;
+    }
+
+    if (saw_tail_event) {
+      return std::nullopt;
+    }
+  }
+  return tail;
+}
+
+std::optional<std::uint64_t> NextSequenceIdAfterSnapshotTail(
+    std::uint64_t snapshot_sequence_id, const EventLog& tail_event_log) {
+  const std::uint64_t last_sequence_id =
+      tail_event_log.empty() ? snapshot_sequence_id : tail_event_log.back().sequence_id;
+  if (last_sequence_id == std::numeric_limits<std::uint64_t>::max()) {
+    return std::nullopt;
+  }
+  return last_sequence_id + 1;
+}
+
 } // namespace
 
 static_assert(sizeof(Money) == sizeof(std::int64_t));
 
 TicketXEngine::TicketXEngine(std::filesystem::path event_log_path)
     : event_writer_(std::make_unique<AsyncEventWriter>(event_log_path)) {
-  if (!std::filesystem::exists(event_log_path)) {
+  (void)recover_from_event_log_file(event_log_path);
+}
+
+TicketXEngine::TicketXEngine(std::filesystem::path event_log_path,
+                             std::filesystem::path snapshot_path)
+    : event_writer_(std::make_unique<AsyncEventWriter>(event_log_path)) {
+  if (!std::filesystem::exists(snapshot_path)) {
+    (void)recover_from_event_log_file(event_log_path);
     return;
+  }
+
+  std::vector<std::string> snapshot_errors;
+  if (recover_from_snapshot_file(event_log_path, snapshot_path, snapshot_errors)) {
+    return;
+  }
+
+  if (std::filesystem::exists(event_log_path)) {
+    (void)recover_from_event_log_file(event_log_path);
+    return;
+  }
+
+  mark_recovery_failed(snapshot_errors.empty()
+                           ? std::vector<std::string>{"failed to recover from snapshot"}
+                           : std::move(snapshot_errors));
+}
+
+bool TicketXEngine::recover_from_event_log_file(const std::filesystem::path& event_log_path) {
+  clear_runtime_state();
+  event_log_recovery_ok_ = true;
+  event_log_recovery_errors_.clear();
+
+  if (!std::filesystem::exists(event_log_path)) {
+    return true;
   }
 
   const std::optional<EventLog> persisted_event_log = load_event_log(event_log_path);
   if (!persisted_event_log.has_value()) {
     mark_recovery_failed({"failed to load existing event log"});
-    return;
+    return false;
   }
 
   RecoveryReport recovery_report = validate_recovery_log(*persisted_event_log);
   if (!recovery_report.ok) {
     mark_recovery_failed(std::move(recovery_report.errors));
-    return;
+    return false;
   }
 
   const std::optional<std::uint64_t> next_sequence_id =
       NextSequenceIdAfter(*persisted_event_log);
   if (!next_sequence_id.has_value()) {
     mark_recovery_failed({"event sequence id overflow"});
-    return;
+    return false;
   }
 
   const ReplayState recovered_state = replay_state(*persisted_event_log);
   if (!hydrate_from_replay_state(recovered_state)) {
     mark_recovery_failed({"failed to hydrate recovered engine state"});
-    return;
+    return false;
   }
 
   event_log_ = *persisted_event_log;
   next_event_sequence_id_ = *next_sequence_id;
+  return true;
+}
+
+bool TicketXEngine::recover_from_snapshot_file(
+    const std::filesystem::path& event_log_path, const std::filesystem::path& snapshot_path,
+    std::vector<std::string>& errors) {
+  const std::optional<Snapshot> snapshot = load_snapshot(snapshot_path);
+  if (!snapshot.has_value()) {
+    errors = {"failed to load snapshot"};
+    return false;
+  }
+
+  EventLog persisted_event_log;
+  if (std::filesystem::exists(event_log_path)) {
+    const std::optional<EventLog> loaded_event_log = load_event_log(event_log_path);
+    if (!loaded_event_log.has_value()) {
+      errors = {"failed to load existing event log"};
+      return false;
+    }
+    persisted_event_log = *loaded_event_log;
+  }
+
+  const std::optional<EventLog> tail_event_log =
+      TailEventsAfterSnapshot(persisted_event_log, snapshot->last_sequence_id);
+  if (!tail_event_log.has_value()) {
+    errors = {"event log is not ordered around snapshot sequence"};
+    return false;
+  }
+
+  RecoveryReport recovery_report =
+      validate_recovery_log_from(snapshot->state, *tail_event_log);
+  if (!recovery_report.ok) {
+    errors = std::move(recovery_report.errors);
+    return false;
+  }
+
+  const std::optional<std::uint64_t> next_sequence_id =
+      NextSequenceIdAfterSnapshotTail(snapshot->last_sequence_id, *tail_event_log);
+  if (!next_sequence_id.has_value()) {
+    errors = {"event sequence id overflow"};
+    return false;
+  }
+
+  const ReplayState recovered_state =
+      replay_state_from(snapshot->state, *tail_event_log);
+  if (!recovered_state.summary.sequence_contiguous ||
+      !recovered_state.summary.trade_groups_complete ||
+      !hydrate_from_replay_state(recovered_state)) {
+    clear_runtime_state();
+    errors = {"failed to hydrate recovered engine state"};
+    return false;
+  }
+
+  event_log_ = std::move(persisted_event_log);
+  next_event_sequence_id_ = *next_sequence_id;
+  return true;
 }
 
 bool TicketXEngine::accepts_commands() const noexcept { return event_log_recovery_ok_; }
 
-void TicketXEngine::mark_recovery_failed(std::vector<std::string> errors) {
-  event_log_recovery_ok_ = false;
-  event_log_recovery_errors_ = std::move(errors);
-  event_writer_.reset();
-
+void TicketXEngine::clear_runtime_state() {
   matching_engine_ = MatchingEngine{};
   wallets_ = WalletLedger{};
   tickets_ = TicketLedger{};
@@ -262,6 +374,13 @@ void TicketXEngine::mark_recovery_failed(std::vector<std::string> errors) {
   locked_buy_amounts_.clear();
   next_ticket_id_ = 1;
   next_event_sequence_id_ = 1;
+}
+
+void TicketXEngine::mark_recovery_failed(std::vector<std::string> errors) {
+  event_log_recovery_ok_ = false;
+  event_log_recovery_errors_ = std::move(errors);
+  event_writer_.reset();
+  clear_runtime_state();
 }
 
 bool TicketXEngine::hydrate_from_replay_state(const ReplayState& state) {
